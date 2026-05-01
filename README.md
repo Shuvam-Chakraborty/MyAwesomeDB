@@ -1,9 +1,5 @@
 # My Awesome DB
 
-This README is meant to explain the repo and how to run it. It is not a rewrite of the full assignment handout.
-
-If you want the full specification, grading rules, and protocol details, read the course assignment separately. This file is the practical version: what we are building, where the work happens, how the data gets prepared, and which commands to run.
-
 ## What We Are Building
 
 We are building a Rust-based out-of-core query engine.
@@ -80,9 +76,7 @@ All commands below assume you are running from the repository root inside a Unix
 
 The starter dataset used in this repo is the TPCH scratch bundle.
 
-1. Download `tpch_scratch.tar.gz` from the course Google Drive folder:
-
-   <https://drive.google.com/drive/folders/1NsbGUAsfacgNLeDUC6KrM_HruTTPfe8v?usp=sharing>
+1. Download `tpch_scratch.tar.gz` from the Google Drive folder [here](https://drive.google.com/file/d/1k68hJikGIaY_YW9eGDz3oKJPyB-7AAf9/view).
 
 2. Place `tpch_scratch.tar.gz` in the repository root.
 3. From the repository root, extract it:
