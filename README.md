@@ -1,98 +1,111 @@
 # My Awesome DB
 
-Rust-based out-of-core query execution engine built for a database systems assignment. The project is designed for datasets that may be much larger than available RAM, communicates through file descriptors instead of ordinary file I/O, and is evaluated on both correctness and I/O-aware performance. It is course infrastructure and experimentation code, not a production database.
+This README is meant to explain the repo and how to run it. It is not a rewrite of the full assignment handout.
 
-## Overview
+If you want the full specification, grading rules, and protocol details, read the course assignment separately. This file is the practical version: what we are building, where the work happens, how the data gets prepared, and which commands to run.
 
-This engine executes query plans represented as JSON ASTs rather than parsing SQL. The supported operators are:
+## What We Are Building
 
-- `Scan` reads a table from block storage.
-- `Filter` applies one or more predicates.
-- `Project` selects and optionally renames columns.
-- `Sort` orders rows by one or more sort keys.
-- `Cross` computes a Cartesian product between two inputs.
+We are building a Rust-based out-of-core query engine.
 
-SQL appears in this repository only as a testing/reference tool: `tests_gen/` runs SQL against a generated SQLite database to produce expected outputs, while the execution engine itself consumes ASTs defined in `common/src/query.rs`.
+The main idea is simple:
 
-## Architecture
+- The dataset can be much larger than RAM.
+- Queries should still run correctly under a tight memory budget.
+- Disk I/O matters, so we want execution plans that avoid unnecessary reads, writes, and spills.
+
+The engine does not parse SQL directly. It executes query plans represented as JSON ASTs built from these operators:
+
+- `Scan`
+- `Filter`
+- `Project`
+- `Sort`
+- `Cross`
+
+At runtime the system looks like this:
 
 ```text
 Monitor  <->  Database  <->  Disk Simulator
-  FD 5/6         FD 3/4
 ```
 
-- The `monitor` crate is the orchestrator. It launches a fresh `disk` process and a fresh `database` process for each enabled query, remaps file descriptors, enforces the assignment limits, and validates the result rows.
-- The `database` crate is the query engine. It reads one JSON query from the monitor, asks for the memory limit, requests table blocks and scratch-space metadata from the disk simulator, executes the plan, and streams rows back for validation.
-- The `disk` crate simulates a block device. It serves fixed-size block reads/writes, exposes file layout metadata such as start block and block count, provides an anonymous writable region for spill, and reports simulated I/O metrics.
+- `monitor/` starts the processes, sends queries, and validates results.
+- `database/` is the query engine we care about most.
+- `disk/` simulates block storage and tracks I/O.
 
-Disk I/O is central to the design because the simulator measures access cost. Reducing unnecessary reads, writes, random access, and spill traffic is part of the assignment objective, not just an implementation detail.
+In practice, most assignment work should happen in `database/`.
 
-## Core Concepts
+## How We Plan To Build It
 
-- Queries are trees of AST nodes, not SQL strings. The shared AST and value types live in `common/`.
-- The engine runs under a strict memory budget, so operators must stream data when possible and spill intermediate state when necessary.
-- Tables are stored as fixed-size disk blocks. Each block ends with a row count, and rows are packed into the block payload without crossing block boundaries.
-- The disk simulator exposes a read-only file region plus a writable anonymous region. The anonymous region is the only place the database can use for scratch/intermediate storage.
-- The generator produces schema metadata and column statistics in `db_config.json`, which the optimizer can use for plan rewrites and execution-strategy choices.
-- This implementation includes scan/filter/project fusion where possible, scratch-backed external sorting, and spill-aware execution for large intermediate results.
+The implementation strategy is:
 
-## Project Structure
+- Read tables block-by-block from the disk simulator instead of trying to load full tables into memory.
+- Keep operators streaming whenever possible, especially `Scan`, `Filter`, and `Project`.
+- Use the anonymous writable region exposed by the disk simulator as scratch space for large intermediate results.
+- Use external/out-of-core sorting for `Sort` when data does not fit in memory.
+- Be careful with `Cross`, because it can explode in size. Push useful work earlier when possible so we move less data.
+- Treat statistics in `db_config.json` as optimization hints, not as hard guarantees.
 
-```text
-.
-+-- common/                   Shared query AST and value/data types
-+-- configs/                  Typed config crates for database, disk, and monitor JSON files
-+-- database/                 Out-of-core query execution engine
-+-- demo_query_printer/       Example AST builder and JSON printer
-+-- disk/                     Block-based disk simulator with I/O metrics
-+-- fd_wrapper/               Raw file-descriptor wrappers used for process communication
-+-- generator/                Dataset compiler and runtime/config generator
-+-- monitor/                  Assignment harness and result validator
-+-- tests_gen/                Visible test/query generator and expected-output refresher
-+-- Cargo.toml                Workspace manifest
-+-- README.md                 Project documentation
-`-- database_study_guide.tex  Optional internal study guide for the `database/` crate
-```
+So the project is not "build a full SQL database". The goal is much narrower: build a query execution engine that can run the provided AST plans correctly and efficiently under assignment constraints.
 
-- `database/` contains the execution engine itself: query optimization, operator execution, row decoding/encoding, scan pipelines, and scratch-space management.
-- `disk/` contains the block-addressable disk simulator and the simulated I/O accounting logic used to measure reads, writes, seeks, and transfer cost.
-- `monitor/` contains the execution harness that spawns processes, wires the required file descriptors, applies resource limits, sends queries, and checks results against expected output files.
-- `generator/` converts CSV + `.schema` inputs into block-packed `.bin` table files, generates runtime configs, computes column statistics for `db_config.json`, and creates a reference `sqlite.db`.
-- `tests_gen/` defines the visible workload and regenerates expected CSV outputs plus `monitor_config.json` by executing SQL equivalents against the generated SQLite database.
-- `configs/` contains the typed config crates for `db_config.json`, `disk_sim_config.json`, and `monitor_config.json`.
-- `common/` contains shared data/value definitions and the query AST used across the workspace.
+## Repo Layout
 
-Supporting crates:
-
-- `fd_wrapper/` wraps raw file descriptors as Rust `Read`/`Write` objects.
-- `demo_query_printer/` shows the query builder API and prints an example AST as JSON.
-- `database_study_guide.tex` is supplementary documentation for understanding the `database/` crate internals; it is not part of the execution pipeline.
+- `database/` - query execution engine
+- `disk/` - disk simulator
+- `monitor/` - harness that runs queries and checks output
+- `generator/` - converts CSV datasets into `.bin` files and generates runtime configs
+- `tests_gen/` - regenerates visible queries and expected outputs using SQLite
+- `common/` - shared AST and data types
+- `configs/` - config crates used by the workspace
+- `demo_query_printer/` - small helper that prints example query AST JSON
 
 ## Requirements
 
+You should run this in a Unix-like environment:
+
+- Linux
+- macOS
+- WSL on Windows
+
+You also need:
+
 - Rust toolchain
-- `sqlite3` CLI
-- A Unix-like runtime environment such as Linux, macOS, or WSL
+- `sqlite3`
+- `tar`
 
-The process launcher and FD wiring in `monitor/`, `database/`, and `disk/` use Unix file-descriptor APIs, so a Unix-compatible environment is required.
+Windows note: the monitor/database/disk setup uses Unix file descriptor APIs, so WSL is the safest way to run this project on Windows.
 
-## Setup and Full Run Order
+All commands below assume you are running from the repository root inside a Unix shell such as bash, zsh, or WSL.
 
-Download the TPCH scratch archive from [here](https://drive.google.com/file/d/1k68hJikGIaY_YW9eGDz3oKJPyB-7AAf9/view?usp=sharing) and place `tpch_scratch.tar.gz` in the repository root.
+## Download The Dataset
 
-Extract the provided scratch files:
+The starter dataset used in this repo is the TPCH scratch bundle.
+
+1. Download `tpch_scratch.tar.gz` from the course Google Drive folder:
+
+   <https://drive.google.com/drive/folders/1NsbGUAsfacgNLeDUC6KrM_HruTTPfe8v?usp=sharing>
+
+2. Place `tpch_scratch.tar.gz` in the repository root.
+3. From the repository root, extract it:
 
 ```bash
 tar -xf tpch_scratch.tar.gz
 ```
 
-Build the workspace:
+After extraction you should have a `scratch/` directory with dataset, compiled output, and runtime folders.
+
+## Build The Project
+
+Run this from the repository root:
 
 ```bash
 cargo build -r
 ```
 
-Generate the TPCH compiled dataset, runtime config files, and SQLite reference database:
+This builds all workspace binaries into `target/release/`.
+
+## Generate The Compiled Dataset And Runtime Files
+
+Once the archive is extracted and the workspace is built, run:
 
 ```bash
 cargo run -r --bin generator -- all \
@@ -103,32 +116,81 @@ cargo run -r --bin generator -- all \
   --block-size 4096
 ```
 
-Regenerate the visible expected outputs and refresh `monitor_config.json`:
+This does the setup work for the whole project:
+
+- converts CSV tables into block-formatted `.bin` files
+- creates `sqlite.db` for reference checking
+- writes `disk_sim_config.json`
+- writes `db_config.json`
+- writes a starter `monitor_config.json`
+
+## Regenerate The Visible Test Outputs
+
+If you want the provided visible workload and expected outputs, run:
 
 ```bash
-cargo run -r --bin tests_gen -- -c scratch/compiled_datasets/tpch -r scratch/runtimes/tpch
+cargo run -r --bin tests_gen -- \
+  --compiled-dataset-folder scratch/compiled_datasets/tpch \
+  --runtime-folder scratch/runtimes/tpch
 ```
 
-Run the full visible TPCH suite:
+This uses `sqlite3` and the generated `sqlite.db` to:
+
+- create the expected output CSV files
+- rewrite `scratch/runtimes/tpch/monitor_config.json` with the visible queries
+
+## Run The Monitor
+
+To run the visible suite:
 
 ```bash
 cargo run -r --bin monitor -- --config scratch/runtimes/tpch/monitor_config.json
 ```
 
-## How the System Runs End-to-End
+The monitor will:
 
-1. The dataset archive is extracted into `scratch/datasets/tpch`.
-2. `generator` packs the CSV tables into block-formatted `.bin` files, builds `sqlite.db`, and writes the runtime JSON configs consumed by the monitor, database, and disk simulator.
-3. `tests_gen` loads the bundled visible queries, runs their SQL equivalents against `sqlite.db`, writes expected CSV outputs, and rewrites `scratch/runtimes/tpch/monitor_config.json`.
-4. `monitor` reads that config and, for each enabled query, starts `disk` and `database`, sends the JSON AST to the database, and supplies the memory budget on request.
-5. `database` executes the plan over disk blocks, using anonymous scratch blocks when an operator must spill.
-6. `monitor` validates the streamed output against the expected CSV, while `disk` reports simulated I/O metrics for the run.
+- launch the disk simulator
+- launch the database process
+- send queries
+- validate the rows returned by your database
 
-## Design Notes
+If you change code in `database/`, rebuild before running again:
 
-- Out-of-core processing matters because the engine cannot assume relations fit in RAM; execution has to be organized around block streams and scratch runs.
-- Disk I/O optimization matters because the simulator tracks access behavior and cost, so better access patterns translate directly into better assignment performance.
-- The single-threaded constraint exists to force algorithmic efficiency under systems-style limits; the monitor sets process/thread limits instead of allowing parallel speedups.
-- Direct file I/O is disallowed so that all intermediate storage goes through the simulated disk interface, making spill behavior explicit, measurable, and comparable across solutions.
+```bash
+cargo build -r
+```
 
-If you want to inspect the query representation directly, start with `common/src/query.rs`, `tests_gen/src/tests.rs`, and `demo_query_printer/`.
+## Typical Workflow
+
+From a clean repo, the usual workflow is:
+
+```bash
+tar -xf tpch_scratch.tar.gz
+cargo build -r
+cargo run -r --bin generator -- all \
+  --dataset-folder scratch/datasets/tpch \
+  --compiled-dataset-folder scratch/compiled_datasets/tpch \
+  --runtime-folder scratch/runtimes/tpch \
+  --build-path target/release \
+  --block-size 4096
+cargo run -r --bin tests_gen -- \
+  --compiled-dataset-folder scratch/compiled_datasets/tpch \
+  --runtime-folder scratch/runtimes/tpch
+cargo run -r --bin monitor -- --config scratch/runtimes/tpch/monitor_config.json
+```
+
+## If You Want To Try A Custom Query
+
+For local debugging, the easiest flow is:
+
+1. Edit `demo_query_printer/src/main.rs`.
+2. Print the AST JSON:
+
+```bash
+cargo run -r --bin demo_query_printer
+```
+
+3. Copy that JSON into a query entry inside `scratch/runtimes/tpch/monitor_config.json`.
+4. Run the monitor again.
+
+If you only want to work on the assignment implementation, you do not need to understand every file in the repo. Start with `database/`, keep the block-based execution model in mind, and use the generator + monitor flow above to test your changes.
