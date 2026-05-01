@@ -1,0 +1,589 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{enumitem}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\newcommand{\func}[2]{\item[\mbox{\path{#1}}] #2}
+\newcommand{\funclist}[2]{\item[\mbox{#1}] #2}
+\newcommand{\filetitle}[1]{\subsection{\texorpdfstring{\path{#1}}{#1}}}
+
+\title{Assignment 3 Database Crate Study Guide}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Big Picture}
+The \path{database} crate is a single-process query engine for the assignment's monitor and disk simulator setup. Its job is to:
+
+\begin{enumerate}[leftmargin=*]
+    \item read one query from the monitor,
+    \item read table blocks from the disk simulator,
+    \item optimize the query tree,
+    \item execute the optimized tree under a memory budget,
+    \item stream result rows back to the monitor in the required textual format.
+\end{enumerate}
+
+The execution path is:
+
+\begin{quote}
+\path{main.rs} $\rightarrow$ configuration and IO setup $\rightarrow$
+\path{optimizer/mod.rs} and \path{optimizer/rules.rs} $\rightarrow$
+\path{executor/mod.rs} $\rightarrow$
+\path{executor/scan.rs}, \path{executor/project.rs}, \path{executor/join.rs}, \path{executor/sort.rs}, \path{executor/filter.rs} $\rightarrow$
+\path{storage/*.rs} and \path{monitor_client.rs}
+\end{quote}
+
+The refactor done here makes two important ideas explicit:
+
+\begin{itemize}[leftmargin=*]
+    \item \path{query_support.rs} now centralizes schema inference, table lookup, predicate classification, and join-key extraction. Earlier, this logic was duplicated in multiple places.
+    \item \path{executor/value.rs} now centralizes value comparison rules. This makes sorting, filtering, join-key handling, and scan-pipeline predicate evaluation follow one comparison policy.
+\end{itemize}
+
+\section{Assignment Constraints That Shape the Design}
+The implementation only makes sense if you keep the assignment rules in mind:
+
+\begin{itemize}[leftmargin=*]
+    \item Memory is tightly limited. That is why large operators cannot assume full materialization. The code instead uses \path{effective_memory}, scan batching, compact in-memory states, partitioning, and scratch-backed runs.
+    \item The process is single-threaded. So the code is written as deterministic streaming control flow with callback sinks rather than worker threads or parallel pipelines.
+    \item Ordinary file IO is forbidden. Temporary data must go through the disk simulator's anonymous space, which is why \path{ScratchSpace}, \path{ScratchRunWriter}, and \path{ScratchRunCursor} exist.
+    \item Performance is judged by simulated IO time plus CPU time. This is why the implementation tries hard to avoid decoding unused columns, avoid redundant sorts, exploit physical ordering metadata, and release scratch runs early.
+    \item Piazza clarified two practical benchmark facts: there are hidden tests, and very large scratch usage can fail runs. So the design avoids dataset-specific tricks and tries to keep scratch usage bounded instead of assuming the visible workload is the whole story.
+\end{itemize}
+
+\section{Runtime Protocols and Physical Formats}
+\textbf{Database process file descriptors.}
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.10\linewidth} >{\raggedright\arraybackslash}p{0.16\linewidth} X}
+\toprule
+FD & Direction & Purpose \\
+\midrule
+3 & read & Receive block data from the disk simulator. \\
+4 & write & Send disk commands to the disk simulator. \\
+5 & read & Receive the query JSON from the monitor. \\
+6 & write & Send monitor commands and result rows back to the monitor. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Monitor-side protocol.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{read_query}{Reads exactly one JSON query line from FD 5 and deserializes it into the AST from \path{common/src/query.rs}.}
+    \func{get_memory_limit_mb}{Writes \path{get_memory_limit} to the monitor and parses the numeric reply.}
+    \func{begin_validation}{Writes \path{validate} before result rows start.}
+    \func{send_row}{Formats one result row as pipe-delimited text and writes it to FD 6.}
+    \func{finish_validation}{Writes \path{!} to signal end of output.}
+\end{description}
+
+\textbf{Disk-side protocol.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{get_block_size}{Asks for the disk block size.}
+    \func{get_file_start_block}{Asks where one named table file begins.}
+    \func{get_file_num_blocks}{Asks how many blocks belong to one named table file.}
+    \func{get_anon_start_block}{Asks where anonymous scratch space begins.}
+    \func{read_blocks}{Sends \path{get block start count} and then reads back raw bytes.}
+    \func{write_blocks}{Sends \path{put block start count} followed by raw scratch bytes.}
+\end{description}
+
+\textbf{Physical row and block format.}
+\begin{itemize}[leftmargin=*]
+    \item Integers and floats are little-endian.
+    \item Strings are null-terminated ASCII.
+    \item A scratch block stores row payload first, and the final 2 bytes hold the row count.
+    \item \path{row_codec.rs} is the single place that turns these raw bytes back into typed values and rows.
+\end{itemize}
+
+\section{Query Semantics That Matter for the Code}
+The assignment AST has only five operator kinds: \path{Scan}, \path{Filter}, \path{Project}, \path{Sort}, and \path{Cross}. A few semantic rules strongly influence the design:
+
+\begin{itemize}[leftmargin=*]
+    \item \path{Project} preserves the row order of its child. That is why the optimizer and executor can safely move reduced projections beneath sort while still preserving final ordering.
+    \item \path{Cross} does not mean ``real join'' by itself. SQL-style joins appear in the AST as filters on top of crosses, so \path{filter.rs} is where join recognition lives.
+    \item A predicate can compare a column to either a literal or another column. This is why predicate compilation and join-key extraction share schema analysis helpers.
+    \item The two children of a \path{Cross} are guaranteed not to share column names. That simplifies predicate classification and join planning.
+    \item The query is assumed valid. So most runtime checks are defensive sanity checks, not full user-facing query validation.
+\end{itemize}
+
+\section{How the Files Connect}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.26\linewidth} X}
+\toprule
+Layer / file family & Responsibility and relationship \\
+\midrule
+\path{main.rs}, \path{cli.rs}, \path{io_setup.rs}, \path{monitor_client.rs} & Entry layer. They parse the config path, connect the fixed file descriptors from the assignment, read the query and memory budget, and emit rows. \\
+\path{query_support.rs} & Shared logical helper layer. It answers: what schema does this operator produce, which table does a scan refer to, which predicates belong to the left side, right side, or cross side, and which predicates form equi-join keys. \\
+\path{row.rs} & In-memory row and schema representation. Every executor module depends on this file. \\
+\path{storage/*.rs} & Physical block IO helpers. \path{disk_client.rs} speaks the disk protocol, \path{row_codec.rs} decodes rows from blocks, and \path{block_allocator.rs} manages scratch runs used by external sort and large joins. \\
+\path{scan_pipeline.rs} & A fused execution path for scan/filter/project combinations. It avoids decoding unnecessary columns and avoids building intermediate rows too early. \\
+\path{estimation.rs} & Cardinality and width estimation. The optimizer and some executor heuristics depend on it. \\
+\path{optimizer/*.rs} & Logical rewrite layer. It pushes filters and projects down, removes redundant work, and reorders cross trees to make joins cheaper. \\
+\path{executor/mod.rs} and \path{executor/value.rs} & Execution support layer. They dispatch operators, compile predicates and sort keys, reserve memory, and define cross-type comparison semantics. \\
+\path{executor/scan.rs}, \path{project.rs}, \path{join.rs}, \path{sort.rs}, \path{filter.rs} & Concrete operator implementations. \path{filter.rs} is especially important because it recognizes join-shaped filters over cross products and turns them into efficient join execution. \\
+\bottomrule
+\end{tabularx}
+
+\section{End-to-End Flow for One Query}
+If you want one linear story to remember for viva, this is the cleanest one:
+
+\begin{enumerate}[leftmargin=*]
+    \item \path{main.rs} parses the config path, loads \path{DbContext}, connects the fixed file descriptors, and constructs \path{DiskClient}, \path{MonitorClient}, and \path{ScratchSpace}.
+    \item The monitor sends one query AST. \path{optimizer/mod.rs} and \path{optimizer/rules.rs} rewrite that AST before execution.
+    \item The optimizer relies on \path{query_support.rs} and \path{estimation.rs} to understand schemas, predicates, physical ordering, and approximate sizes.
+    \item \path{executor/mod.rs} becomes the central dispatcher. It compiles predicates or sort specs when needed and forwards each operator to the correct implementation file.
+    \item If the subtree is only scan/filter/project, \path{scan_pipeline.rs} may fuse it into one physical pipeline that reads only required columns.
+    \item If the subtree needs sorting, \path{executor/sort.rs} decides between segmented sorting, compact in-memory sorting, or external scratch-backed runs.
+    \item If a filter sits above a cross and contains equi-join predicates, \path{executor/filter.rs} upgrades the runtime plan into merge join, hash join, partitioned hash join, or fallback materialized join.
+    \item Whenever a large intermediate result must leave memory, \path{storage/block_allocator.rs} allocates anonymous scratch blocks and streams rows into or out of scratch runs.
+    \item Final output rows are formatted by \path{monitor_client.rs} and streamed back to the monitor one row at a time.
+\end{enumerate}
+
+\section{File-by-File Walkthrough}
+
+\filetitle{database/src/main.rs}
+\textbf{Role.} This is the top-level driver for the database process.
+
+\textbf{Functions.}
+\begin{description}[leftmargin=2.6cm, style=nextline]
+    \func{db_main}{Orchestrates the whole run: parse CLI, load DB metadata, set up monitor and disk IO, read the query, optimize it, request the memory budget, create scratch space, execute the query, and close validation cleanly. This function exists so the full control flow is visible in one place.}
+    \func{main}{Wraps \path{db_main} with one top-level error context string. Its purpose is to make failures easier to trace.}
+\end{description}
+
+\textbf{Why this file exists.} It keeps startup logic separate from operator code. That separation makes the engine easier to explain: ``main wires the system together, the executor does the work.''
+
+\filetitle{database/src/cli.rs}
+\textbf{Role.} Minimal command-line parsing.
+
+\textbf{Functions and types.}
+\begin{description}[leftmargin=2.6cm, style=nextline]
+    \func{CliOptions}{Stores the single required CLI input: the path to the DB config file.}
+    \func{config_path}{Returns the config path as \path{&Path}. The reason for this accessor is to keep path handling precise and avoid exposing the backing \path{PathBuf} more than needed.}
+\end{description}
+
+\filetitle{database/src/io_setup.rs}
+\textbf{Role.} Maps the assignment's fixed file descriptors into Rust \path{Read}/\path{Write} handles.
+
+\textbf{Functions.}
+\begin{description}[leftmargin=2.6cm, style=nextline]
+    \func{setup_disk_io}{Builds the read and write handles for the disk simulator using file descriptors 3 and 4.}
+    \func{setup_monitor_io}{Builds the read and write handles for the monitor using file descriptors 5 and 6.}
+\end{description}
+
+\textbf{Why this file exists.} The assignment hardcodes the descriptor mapping. Keeping that mapping in one file prevents protocol plumbing from leaking into the rest of the engine.
+
+\filetitle{database/src/monitor_client.rs}
+\textbf{Role.} Implements the text protocol spoken with the monitor.
+
+\textbf{Functions and types.}
+\begin{description}[leftmargin=2.6cm, style=nextline]
+    \func{MonitorClient}{Wraps buffered monitor input, monitor output, and a reusable row buffer.}
+    \func{new}{Builds the client and preallocates a row buffer so result emission does not allocate for every row.}
+    \func{read_query}{Reads one JSON line and deserializes it into the query AST.}
+    \func{get_memory_limit_mb}{Requests the runtime memory budget from the monitor and parses the response.}
+    \func{begin_validation}{Tells the monitor that result rows are about to start.}
+    \func{send_row}{Formats one in-memory row into the monitor's pipe-delimited text format.}
+    \func{finish_validation}{Sends the end marker expected by the monitor.}
+    \func{append_formatted_value}{Formats one typed value into the output buffer. It exists to keep \path{send_row} short and to centralize formatting rules.}
+\end{description}
+
+\filetitle{database/src/query_support.rs}
+\textbf{Role.} Shared logical helper layer used by the optimizer, estimator, scan pipeline, and executor.
+
+\textbf{Functions and types.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{PredicateSide}{Represents whether a predicate belongs only to the left schema, only to the right schema, or spans both.}
+    \func{infer_schema}{Computes the output schema of any query subtree. This is needed in optimization, join planning, and projection handling.}
+    \func{find_table_spec}{Resolves a scan target using either table name or file id.}
+    \func{split_cross_predicates}{Partitions predicates into left-only, right-only, and cross predicates. This is essential for pushdown and join planning.}
+    \func{extract_join_keys}{Finds equi-join predicate pairs that can be used as join keys.}
+    \func{classify_predicate}{Determines whether a predicate belongs to the left side, right side, or the combined output.}
+    \func{predicate_columns}{Returns the set of column names referenced by one predicate.}
+\end{description}
+
+\textbf{Why this file exists.} The same reasoning was needed in several parts of the crate. Centralizing it reduces duplication and makes the architecture easier to teach: schema logic lives in one place.
+
+\filetitle{database/src/row.rs}
+\textbf{Role.} Defines the in-memory schema and row model used during execution.
+
+\textbf{Functions and types.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{SchemaColumn}{Stores one column name and type.}
+    \func{Schema}{Stores ordered columns plus a name-to-index map for fast lookup.}
+    \func{Schema::from_table_spec}{Builds an execution schema from DB metadata.}
+    \func{Schema::columns}{Returns the ordered column list.}
+    \func{Schema::len}{Returns the number of columns.}
+    \func{Schema::index_of}{Maps a column name to its positional index.}
+    \func{Schema::column_at}{Returns one column descriptor by position.}
+    \func{Schema::project}{Builds the projected schema and the index map needed to project rows.}
+    \func{Schema::combine}{Builds the output schema of a cross or join by concatenating left and right schemas.}
+    \func{Row}{Stores one vector of typed values.}
+    \func{Row::new}{Constructs one row.}
+    \func{Row::values}{Returns a slice of all values.}
+    \func{Row::get}{Returns a value by position.}
+    \func{Row::into_project}{Builds a projected row using a list of source indexes. It handles duplicate projections correctly by cloning only when needed.}
+    \func{Row::combine}{Concatenates two rows to form a cross or join output row.}
+    \func{Row::serialized_size}{Computes how many bytes the row will need in scratch storage.}
+    \func{Row::estimated_heap_bytes}{Estimates heap memory used by the row. This supports memory-budget decisions in join and sort code.}
+    \func{Row::encode_into}{Serializes the row into a byte buffer.}
+    \func{serialized_size_of}{Returns serialized width of one value.}
+    \func{heap_bytes_of}{Returns heap contribution of one value.}
+    \func{encode_data}{Serializes one value using the assignment's on-disk format.}
+\end{description}
+
+\filetitle{database/src/storage/mod.rs}
+\textbf{Role.} Tiny module boundary for the storage layer.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \funclist{\path{pub mod block_allocator}, \path{pub mod disk_client}, \path{pub mod row_codec}}{Expose the three storage submodules through one namespace so the rest of the crate can import storage helpers consistently.}
+\end{description}
+
+\textbf{Why this file exists.} It is small, but it clearly marks the storage layer as a package of three coordinated responsibilities: protocol access, row decoding, and scratch allocation.
+
+\filetitle{database/src/storage/disk_client.rs}
+\textbf{Role.} Small protocol client for the disk simulator.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{DiskClient}{Owns buffered disk input, disk output, and a cached block size.}
+    \func{new}{Constructs the client.}
+    \func{get_block_size}{Reads and caches disk block size.}
+    \func{get_file_start_block}{Queries where a file starts.}
+    \func{get_file_num_blocks}{Queries how many blocks a file occupies.}
+    \func{get_anon_start_block}{Queries where scratch space begins.}
+    \func{read_blocks}{Issues one read command and receives raw block bytes.}
+    \func{write_blocks}{Issues one write command for scratch blocks, with size checking.}
+    \func{cmd_u64}{Shared helper for disk commands that return one integer.}
+\end{description}
+
+\filetitle{database/src/storage/row_codec.rs}
+\textbf{Role.} Decodes stored bytes back into rows and values.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{decode_rows_from_block}{Decodes every row in one full block.}
+    \func{decode_projected_rows_from_block}{Decodes only selected columns from each row in one block.}
+    \func{projected_positions_by_column}{Precomputes where projected columns should be placed in the output row.}
+    \func{decode_row_from_bytes}{Decodes one serialized row from a byte slice.}
+    \func{decode_value_from_bytes}{Decodes one typed value and returns both the value and the number of bytes consumed.}
+    \func{skip_value_from_bytes}{Skips one encoded value without materializing it. This is important for projected scans and the scan pipeline.}
+\end{description}
+
+\filetitle{database/src/storage/block_allocator.rs}
+\textbf{Role.} Manages scratch-space runs used by out-of-core algorithms.
+
+\textbf{Main types.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{ScratchRun}{Represents a logical sequence of scratch blocks.}
+    \func{ScratchRunCursor}{Sequential reader over a scratch run.}
+    \func{ScratchRunWriter}{Buffered writer that packs encoded rows into scratch blocks.}
+    \func{ScratchSpace}{Tracks free blocks and allocates new anonymous scratch blocks.}
+\end{description}
+
+\textbf{Main functions.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \funclist{\path{ScratchRun::new}, \path{ScratchRun::empty}, \path{ScratchRun::block_ids}}{Construct and inspect scratch runs.}
+    \funclist{\path{ScratchRunCursor::new}, \path{ScratchRunCursor::next_row}}{Read rows from a run in batches of contiguous blocks.}
+    \funclist{\path{ScratchRunWriter::new}, \path{push_row}, \path{push_encoded_row}, \path{finish}}{Create and finalize streamed scratch output.}
+    \funclist{\path{prepare_row_write}, \path{flush_block}, \path{queue_block_write}, \path{flush_pending_blocks}, \path{reserve_writer_block}}{Internal helpers for packing rows into blocks and flushing contiguous writes efficiently.}
+    \funclist{\path{ScratchSpace::new}, \path{block_size}, \path{reserve_contiguous_blocks}, \path{release_run}, \path{release_blocks}, \path{take_contiguous_free_blocks}}{Scratch allocator management.}
+    \funclist{\path{write_rows_to_scratch}, \path{write_rows_to_scratch_ptr}}{Materialize a slice of rows into a scratch run.}
+    \funclist{\path{read_scratch_run}, \path{read_scratch_run_ptr}}{Stream rows back out of a scratch run.}
+    \func{finalize_block}{Stores the row count in the block trailer.}
+    \func{contiguous_batch_len}{Groups physically adjacent scratch blocks into one IO batch.}
+\end{description}
+
+\textbf{Why this file matters.} It is the bridge between memory-budgeted algorithms and disk-backed temporary data.
+
+\filetitle{database/src/scan_pipeline.rs}
+\textbf{Role.} Builds and executes a fused pipeline for scan-only subtrees consisting of scan, filter, and project.
+
+\textbf{Why it exists.} Without this file, even a simple projected scan would decode every column and materialize full rows before filtering. The pipeline path reads only required columns and applies predicates as early as possible.
+
+\textbf{Core types.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{ScanPipelinePlan}{Compiled physical plan for a scan subtree.}
+    \func{BaseColumnMeta}{Metadata for one base table column.}
+    \func{OutputColumnMeta}{Explains how one output column maps back to a required base column.}
+    \func{VisibleColumn}{Tracks logical column visibility through projections.}
+    \func{LogicalScanPipeline}{Logical intermediate form before final compilation.}
+    \funclist{\path{LogicalPredicate}, \path{LogicalPredicateOperand}}{Predicate representation before required-column indexes are finalized.}
+    \funclist{\path{CompiledPipelinePredicate}, \path{CompiledPipelinePredicateOperand}}{Predicate representation after required-column indexes are known.}
+    \func{ScanPipelineCursor}{Runtime state for batch-wise scan execution.}
+\end{description}
+
+\textbf{Functions.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{try_compile_scan_pipeline}{Attempts to turn a subtree into a fused scan pipeline. Returns \path{None} when the subtree includes operators that cannot be fused, such as sort or cross.}
+    \func{ScanPipelinePlan::schema}{Returns output schema.}
+    \func{ScanPipelinePlan::output_physically_ordered}{Reports whether one output column remains physically ordered on disk. This supports optimizer and merge-join decisions.}
+    \func{ScanPipelineCursor::new}{Initializes runtime cursor state, block locations, and required-column storage.}
+    \func{ScanPipelineCursor::next_row}{Returns the next row that survives pipeline predicates.}
+    \funclist{\path{advance_block}, \path{load_next_batch}, \path{decode_current_row}}{Internal runtime helpers for block iteration and row decoding.}
+    \func{execute_scan_pipeline}{Runs a compiled scan pipeline and streams rows to a sink.}
+    \func{compile_logical_scan_pipeline}{Builds a logical scan/filter/project view by walking the subtree.}
+    \func{compile_pipeline_predicate}{Converts one query predicate into pipeline form.}
+    \func{find_visible_column}{Resolves projected names while building the logical pipeline.}
+\end{description}
+
+\filetitle{database/src/estimation.rs}
+\textbf{Role.} Estimates row counts, distinct counts, and row widths for planning and memory heuristics.
+
+\textbf{Public API.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{estimate_query_rows}{Estimates result size of a subtree.}
+    \func{estimate_query_rows_with_predicates}{Same as above, but allows the caller to add hypothetical predicates. This is useful during pushdown and join-order reasoning.}
+    \func{estimate_distinct_values}{Estimates the number of distinct values for one column in a subtree.}
+    \func{estimated_schema_row_bytes}{Estimates average in-memory width of rows with a given schema.}
+\end{description}
+
+\textbf{Internal helper families.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \funclist{\path{estimate_cross_rows}, \path{estimate_join_rows}}{Cross and join cardinality estimation.}
+    \funclist{\path{estimate_scan_rows_with_predicates}, \path{estimate_scan_rows}}{Scan cardinality estimation with or without predicates.}
+    \funclist{\path{table_row_count}, \path{stats_row_count}, \path{histogram_row_count}, \path{column_distinct_values}, \path{stats_cardinality}, \path{stats_density}}{Extract numeric statistics from metadata.}
+    \funclist{\path{estimate_scan_predicate_selectivity}, \path{equality_selectivity}, \path{inequality_selectivity}, \path{string_inequality_selectivity}, \path{stats_range}, \path{comparison_value_to_data}, \path{numeric_data_value}, \path{default_selectivity}}{Selectivity model for scan predicates.}
+    \funclist{\path{apply_selectivity}, \path{apply_generic_predicate_penalty}}{Clamp and combine selectivities safely.}
+    \func{remap_project_predicates}{Pulls predicates back through a projection so estimates stay attached to base columns.}
+\end{description}
+
+\textbf{Why this file exists.} The optimizer needs fast, approximate answers. This file is the cost-model layer.
+
+\filetitle{database/src/executor/mod.rs}
+\textbf{Role.} Central executor support file.
+
+\textbf{Functions and types.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{CompiledPredicate}{Stores a predicate with resolved column indexes.}
+    \func{PredicateOperand}{Represents either a column reference or a literal on the right-hand side of a predicate.}
+    \func{CompiledSortSpec}{Stores a sort key with resolved column index.}
+    \func{execute_query}{Entry point for executing the root query.}
+    \func{execute_op}{Dispatches to the correct operator implementation.}
+    \func{compile_predicates}{Turns schema-relative predicate text into fast index-based runtime predicates.}
+    \func{compile_sort_specs}{Turns sort column names into index-based sort specs.}
+    \func{row_satisfies_predicates}{Evaluates compiled predicates against one row.}
+    \func{effective_memory}{Reserves part of the monitor budget for overhead and exposes the safe working budget to heavy operators.}
+    \func{scan_batch_blocks}{Converts memory budget and block size into a scan batch size.}
+\end{description}
+
+\textbf{Why this file exists.} It separates common execution support from operator-specific logic.
+
+\filetitle{database/src/executor/value.rs}
+\textbf{Role.} Central comparison policy for filtering, sorting, and join-key hashing.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{compare_rows}{Compares two rows according to compiled sort specs. It uses the same mixed-numeric comparison policy as predicate evaluation so sort order and filter semantics do not disagree.}
+    \func{compare_values}{Compares two values and reports an error if they are incomparable.}
+    \func{compare_data}{Implements query predicates such as \path{EQ}, \path{GT}, and \path{LTE}.}
+    \func{exact_integral_i64_from_f64}{Recognizes when a float exactly represents an integer.}
+    \func{normalized_f64_bits}{Normalizes the bit pattern used when hashing non-integral floats.}
+    \funclist{\path{compare_data_order}, \path{compare_numeric_order}, \path{numeric_kind}}{Low-level comparison helpers.}
+    \funclist{\path{compare_int_to_float}, \path{signed_i64_from_u128}, \path{compare_positive_int_to_positive_float}, \path{bit_length_u64}}{Precision-preserving helpers for mixed integer/float comparison.}
+    \funclist{\path{BinaryFloat}, \path{BinaryFloat::from_f64}}{Expose the binary pieces of a float so large mixed-type comparisons can be done without lossy conversion.}
+\end{description}
+
+\textbf{Why this file exists.} It gives the whole engine one precise answer to the question ``how are values compared?''
+
+\filetitle{database/src/executor/scan.rs}
+\textbf{Role.} Implements table scanning and projected scanning.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{execute_scan}{Runs a full table scan. It first tries the fused scan pipeline; otherwise it falls back to block decoding.}
+    \func{execute_scan_project}{Runs a projected scan. It also first tries the fused scan pipeline.}
+    \func{scan_table}{Shared block-reading loop with batched disk reads and per-block decoding.}
+\end{description}
+
+\filetitle{database/src/executor/project.rs}
+\textbf{Role.} Implements projection and projection-aware rewrites during execution.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{execute_project}{Executes a project node. It specializes scan-project and project-over-sort cases to avoid unnecessary work.}
+    \func{project_over_sort}{Pushes a reduced projection beneath sort so sort keys are still available while extra columns are dropped early.}
+    \func{reduced_projection}{Builds the minimum projection that preserves both requested output columns and required sort keys.}
+\end{description}
+
+\filetitle{database/src/executor/join.rs}
+\textbf{Role.} Implements plain cross-product execution and simple right-side materialization.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{execute_cross}{Runs a cross product by materializing the right side and streaming the left side.}
+    \func{materialize}{Stores a subtree either in memory or in scratch, depending on the available budget.}
+\end{description}
+
+\filetitle{database/src/executor/sort.rs}
+\textbf{Role.} Implements out-of-core sorting with multiple fast paths.
+
+\textbf{Important idea.} Sort has three main strategies:
+\begin{enumerate}[leftmargin=*]
+    \item if input is already physically ordered on the first ascending key, use segmented sorting;
+    \item if rows fit in a compact encoded form, keep a compact in-memory sort state;
+    \item otherwise create sorted runs in scratch space and merge them.
+\end{enumerate}
+
+\textbf{Key types.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{ScratchIo}{Small shared scratch-write context. The cleaned-up sort code borrows this helper through run creation and segmented flushes instead of passing scratch-write ownership around.}
+    \funclist{\path{CompactRowRef}, \path{CompactSortState}, \path{CompactSortLayout}, \path{CompactValueSpan}, \path{HeapItem}}{Internal data structures for compact sorting and run merging.}
+\end{description}
+
+\textbf{Functions by stage.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{execute_sort}{Main sort entry point. Chooses the strategy and emits final rows. Its collection closure now reuses one borrowed scratch context, which keeps the control flow cleaner and avoids ownership churn while building runs.}
+    \funclist{\path{try_execute_segmented_ordered_scan_sort}, \path{flush_segment}}{Fast path when the first sort key is already physically ordered on disk. It buffers only one equal-key segment at a time, flushes that segment, and then releases any scratch runs before continuing.}
+    \funclist{\path{sort_run_budget}, \path{structural_memory_reserve}, \path{contains_join_like}, \path{estimated_sort_row_bytes}, \path{compact_sort_budget}, \path{initial_compact_capacity}}{Memory-budget heuristics used to decide how much state sort may keep in memory.}
+    \funclist{\path{CompactSortState::with_capacity}, \path{try_push_row}, \path{ensure_storage_capacity}, \path{ensure_row_capacity}, \path{reserved_bytes}}{Manage encoded compact rows while respecting the budget.}
+    \funclist{\path{flush_compact_run}, \path{emit_compact_rows}, \path{push_standard_row}, \path{flush_run}, \path{merge_runs}}{Core external-sort mechanics. The helpers now all work against the shared scratch context by reference, so compact flushing, standard run spilling, and final run materialization follow one consistent interface.}
+    \funclist{\path{CompactSortLayout::from_specs}, \path{compare}, \path{compare_inline}}{Define how encoded compact rows are compared without always fully decoding them.}
+    \funclist{\path{decode_sort_value_at_column}, \path{decode_compact_row}, \path{encoded_value_size}}{Helpers for partial decoding of encoded rows.}
+    \func{HeapItem::cmp}{Defines heap ordering for the k-way merge phase.}
+\end{description}
+
+\textbf{Why this file exists.} Sorting is the main out-of-core operator in the assignment. This file isolates all sort-specific budget decisions and scratch-run handling.
+
+\filetitle{database/src/executor/filter.rs}
+\textbf{Role.} Executes ordinary filters and, more importantly, recognizes join-shaped filters above cross products and runs them as real joins.
+
+\textbf{High-level story.}
+\begin{enumerate}[leftmargin=*]
+    \item If the subtree is just scan/filter/project, try the scan pipeline.
+    \item If the filter is sitting on top of a cross tree, split predicates into left, right, and cross predicates.
+    \item If cross predicates form equi-join keys, try ordered merge join, then in-memory hash join, then partitioned hash join.
+    \item If no useful join keys exist, fall back to materialized nested-loop style execution.
+\end{enumerate}
+
+\textbf{Key types.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{FilteredOp}{Refactored helper that bundles a subtree with its local predicates.}
+    \func{JoinInput}{Refactored helper that bundles a join side with its schema, join keys, and estimated hash-build size.}
+    \func{DeterministicHasher}{Stable hasher used for join-key hashing.}
+    \funclist{\path{CompactHashRows}, \path{MaterializedRows}, \path{PartitionedRuns}, \path{HybridBuildPartition}, \path{JoinBloomFilter}, \path{HashBuildBudgetExceeded}}{Internal runtime support types for join execution.}
+    \funclist{\path{NumericJoinKey}, \path{FloatJoinKey}}{Support consistent join hashing across mixed numeric types.}
+\end{description}
+
+\textbf{Function groups.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \funclist{\path{execute_filter}, \path{try_execute_scan_pipeline_op}, \path{try_execute_join_filter}, \path{try_execute_wrapped_join_filter}, \path{execute_join_subtree}, \path{execute_cross_subtree}}{Entry and dispatch layer. These functions decide whether the filter should stay a plain filter or become a join plan.}
+    \funclist{\path{try_execute_ordered_unique_merge_join}, \path{is_estimated_unique_key}, \path{execute_ordered_merge_join}}{Ordered merge-join fast path for physically ordered inputs.}
+    \funclist{\path{execute_equality_join}, \path{estimated_build_cost}, \path{estimated_direct_hash_build_cost}, \path{estimated_hash_row_bytes}, \path{should_try_direct_hash_build}}{Decision layer for choosing direct hash build versus partitioned execution.}
+    \funclist{\path{execute_partitioned_hash_join_from_subtrees}, \path{supports_hybrid_partitioning}, \path{execute_partitioned_hash_join_from_runs}}{Main partitioned hash-join path, including recursive repartitioning and final fallback.}
+    \funclist{\path{execute_materialized_join}, \path{materialize_subtree_rows}, \path{MaterializedRows::for_each}, \path{MaterializedRows::release}}{Fallback path when no useful hashable join keys exist.}
+    \funclist{\path{try_build_hash_rows}, \path{try_build_hash_run}, \path{hash_build_budget}, \path{hybrid_hash_resident_budget}, \path{materialization_budget}, \path{hash_map_reserved_bytes}, \path{encode_row_to_boxed}, \path{insert_build_row}, \path{insert_encoded_build_row}}{Hash-build support and budget enforcement.}
+    \funclist{\path{flush_hybrid_build_partition}, \path{partition_subtree_rows}, \path{partition_run_rows}, \path{finish_partition_writers}, \path{partition_index_for_digest}, \path{join_filter_budget}, \path{JoinBloomFilter::new}, \path{insert}, \path{may_contain}, \path{set_bit}, \path{get_bit}, \path{bloom_hashes}}{Partition-management and bloom-filter support.}
+    \funclist{\path{execute_probe_subtree_against_hash}, \path{execute_probe_run_against_hash}, \path{emit_hash_join_matches}, \path{emit_hash_join_matches_for_digest}, \path{execute_nested_loop_join_on_runs}}{Probe and output layer.}
+    \funclist{\path{mix_hash_word}, \path{avalanche}, \path{join_key_digest_for_row}, \path{hash_join_value}, \path{hash_join_numeric_float}, \path{join_numeric_float}}{Stable join-key hashing logic.}
+    \funclist{\path{wrap_filter_if_needed}, \path{remap_project_predicates}, \path{remap_project_column}}{Small logical helpers used when filters move through projections or need wrapping.}
+\end{description}
+
+\textbf{Why this file matters.} This is where the assignment moves from ``execute the AST literally'' to ``recognize the query pattern and run something smarter.''
+
+\filetitle{database/src/optimizer/mod.rs}
+\textbf{Role.} Small public wrapper around the optimizer rules.
+
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \func{optimize_query}{Applies rule-based optimization to the root query.}
+\end{description}
+
+\filetitle{database/src/optimizer/rules.rs}
+\textbf{Role.} Implements logical rewrites and join-order selection.
+
+\textbf{Main themes.}
+\begin{itemize}[leftmargin=*]
+    \item remove redundant work,
+    \item push filters and projections closer to scans,
+    \item exploit physical ordering metadata,
+    \item reorder cross trees using estimated costs.
+\end{itemize}
+
+\textbf{Functions by theme.}
+\begin{description}[leftmargin=2.8cm, style=nextline]
+    \funclist{\path{optimize_op}, \path{optimize_project}, \path{optimize_sort}, \path{optimize_cross}, \path{optimize_filter}}{Top-level recursive rewrite functions for each operator type.}
+    \funclist{\path{push_filter_through_cross}, \path{push_filter_through_project}}{Predicate pushdown rules.}
+    \funclist{\path{push_project_through_filter}, \path{push_project_through_sort}, \path{push_project_through_cross}}{Projection pushdown rules.}
+    \funclist{\path{compose_projects}, \path{simplify_project}, \path{wrap_filter}, \path{wrap_project_if_needed}}{Small rewrite helpers.}
+    \funclist{\path{sort_redundant}, \path{trace_to_scan}}{Remove redundant sorts when metadata says the relevant column is already physically ordered.}
+    \funclist{\path{dedup_predicates}, \path{predicate_key}, \path{dedup_sort_specs}}{Cleanup helpers that avoid repeated logical work.}
+    \funclist{\path{projection_for_filter}, \path{projection_for_sort}, \path{projection_for_side}}{Build reduced projections during pushdown.}
+    \funclist{\path{remap_predicates}, \path{remap_col}}{Translate predicates through projections.}
+    \func{is_identity}{Detect a projection that changes nothing and can be removed.}
+    \funclist{\path{reorder_cross_tree}, \path{PlanState}, \path{seed_plan_score}, \path{flatten_cross_inputs}, \path{rebuild_left_deep_cross}}{Join-order search over cross inputs.}
+    \funclist{\path{estimate_input_with_local_filters}, \path{estimate_join_extension_score}, \path{estimate_ordered_merge_join_score}}{Cost model used by join-order selection.}
+    \funclist{\path{predicate_belongs_to_schema}, \path{predicate_connects_schemas}, \path{count_connecting_predicates}}{Predicate-to-schema relationship helpers used during join-order planning.}
+\end{description}
+
+\textbf{Why this file exists.} It keeps execution code focused on runtime behavior while logical rewrites stay in one place.
+
+\section{Important Invariants to Remember}
+These are the facts that many functions quietly rely on:
+
+\begin{itemize}[leftmargin=*]
+    \item \path{infer_schema} must be the single source of truth for output schemas. If two modules reason about schemas differently, join keys, projections, and predicate indexes all become unsafe.
+    \item \path{compare_values} must be the single source of truth for cross-type numeric comparison. Sort, filter, and join hashing all need compatible numeric semantics.
+    \item Scratch runs are temporary resources that must be released after use. A correct algorithm can still fail benchmarks if it leaks scratch blocks or keeps runs alive too long.
+    \item \path{ScanPipelinePlan::output_physically_ordered} is important far beyond scan. The optimizer, sort fast path, and merge join fast path all depend on physical ordering metadata being propagated correctly.
+    \item Join optimization in \path{filter.rs} is semantics-preserving because predicates are split into left-only, right-only, and cross predicates before execution strategy is chosen.
+    \item \path{Project} is order-preserving. That one assignment rule is why reduced projection beneath sort is valid.
+    \item The code assumes one process, one query, and one streaming output phase. There is no transaction layer, no concurrency control, and no buffer manager beyond the lightweight block batching already present.
+\end{itemize}
+
+\section{Likely Viva Questions}
+\textbf{Why is join logic in \path{filter.rs} instead of \path{join.rs}?}
+
+Because the AST represents SQL joins as filters on top of cross products. \path{join.rs} only knows how to execute a literal cross. \path{filter.rs} is the first place where the code can see both the cross structure and the join predicates together.
+
+\textbf{Why do we need \path{query_support.rs} if the logic is not very long?}
+
+Because schema inference, predicate classification, and join-key extraction are shared by the optimizer, estimator, scan pipeline, and executor. Centralizing them prevents subtle inconsistencies.
+
+\textbf{Why is there a separate \path{scan_pipeline.rs}?}
+
+Because many real query subtrees are just scan plus filter plus project. A fused path avoids decoding columns that will never be used and avoids building unnecessary intermediate rows.
+
+\textbf{Why is scratch space such a big deal in this assignment?}
+
+Because memory is limited and normal filesystem writes are forbidden. Out-of-core operators therefore need their own disciplined scratch allocator on top of the disk simulator's anonymous space.
+
+\textbf{How does the code exploit physical ordering?}
+
+It removes redundant sorts, enables segmented sort when the first sort key is already ordered on disk, and enables ordered merge-join style execution when both sides have ordered join keys.
+
+\textbf{How does the code stay generic enough for hidden tests?}
+
+It works from metadata, schemas, predicates, and table statistics rather than hardcoding query-specific or dataset-specific behavior. That matters because Piazza explicitly warned that hidden tests and code reading are part of evaluation.
+
+\section{How to Explain the Whole System Orally}
+If you need to explain the project to a professor, a clean sequence is:
+
+\begin{enumerate}[leftmargin=*]
+    \item ``The monitor sends one query AST and one memory budget.''
+    \item ``The database crate loads table metadata, then optimizes the AST before execution.''
+    \item ``Schema and predicate analysis are centralized in \path{query_support.rs}. That is how the optimizer and executor agree on column layout and join keys.''
+    \item ``Simple scan/filter/project subtrees use the scan pipeline so we decode only needed columns and apply predicates early.''
+    \item ``Sort uses either segmented ordered scans, compact in-memory sorting, or scratch-backed external sort depending on data shape and memory.'' 
+    \item ``Filter recognizes join predicates over cross products and upgrades them into merge join, hash join, partitioned hash join, or materialized fallback.''
+    \item ``Scratch space is managed explicitly in \path{block_allocator.rs}, because the assignment forbids ordinary file IO.'' 
+    \item ``Results are streamed to the monitor row by row using the assignment's pipe-delimited format.''
+\end{enumerate}
+
+\section{Why the Cleaned Version is Easier to Study}
+The main readability improvements are:
+
+\begin{itemize}[leftmargin=*]
+    \item shared logical helpers are no longer duplicated;
+    \item comparison logic is centralized in \path{executor/value.rs};
+    \item sort scratch plumbing is grouped into \path{ScratchIo};
+    \item join-side arguments in \path{filter.rs} are grouped into \path{FilteredOp} and \path{JoinInput};
+    \item config validation is stronger and the config/path APIs are more precise.
+\end{itemize}
+
+These changes do not try to invent a different query engine. They keep the same architecture, but make the codebase easier to explain layer by layer.
+
+\end{document}
