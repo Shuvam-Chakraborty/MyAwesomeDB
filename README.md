@@ -4,6 +4,8 @@ Small Rust database project with TPCH data generation, expected-output generatio
 
 ## Full Run Order
 
+Download the dataset from [here](https://drive.google.com/file/d/1k68hJikGIaY_YW9eGDz3oKJPyB-7AAf9/view?usp=sharing). Put it in the root directory.
+
 Extract the provided scratch files:
 
 ```bash
